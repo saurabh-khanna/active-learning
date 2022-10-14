@@ -1,0 +1,12 @@
+data/
+.Rproj.user/
+.DS_Store
+
+*.pdf
+*.tex
+*.docx
+*.png
+*.dta
+*.csv
+*.xlsx
+*.Rproj

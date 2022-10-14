@@ -1,0 +1,1243 @@
+---
+title: "Analysis for Active Learning Paper"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    extra_dependencies: ["dcolumn", "booktabs", "caption", "float"]
+    toc: yes
+    toc_depth: 6
+    keep_tex: no
+urlcolor: blue
+---
+
+\captionsetup[table]{labelformat=empty}
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F, fig.retina = 4)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Libraries
+pacman::p_load(haven, estimatr, extrafont, texreg, janitor, hrbrthemes, xtable, papeR, tidyverse, compareGroups, Hmisc, psych)
+
+extrafont::loadfonts()
+```
+
+\newpage
+
+# Experimental Sample
+
+The experimental sample refers to 37 departments in Indian colleges where students were randomly assigned instructors within a given department-course. We further restrict our analysis to 20 of these 37 departments where we also have course-level grades (on a 0-100 scale) for students.
+
+Our treatment is the extent to which faculty enable active learning for students in their classrooms. This 0-13 score is currently constructed based on [section III of Wieman and Gilbert's teaching practices inventory](https://www.lifescied.org/doi/epdf/10.1187/cbe.14-02-0023). The score is standardized before use in tables ahead.
+
+```{r}
+# Student Data
+df_stu <- 
+  read_dta(here::here("data", "stu_admin_all_latest.dta")) %>%
+  transmute(
+    stdid, classid, department_id, ea_stud_group_criteria, grade,
+    math_tercile = ntile(b_math_g1_score, 3),
+    math_lowest_tercile = if_else(math_tercile == 1, 1L, 0L),
+    reservation = dplyr::recode(reservation, "Non-reservation" = 0L, "Reservation" = 1L, .default = NA_integer_),
+  )
+
+df <- 
+  read_dta(here::here("data", "all_appended.dta")) %>% 
+  distinct(stdid, course_name, facid, .keep_all = T) %>% 
+  left_join(
+    df_stu %>% 
+      select(stdid, classid, department_id, ea_stud_group_criteria, grade, reservation, math_lowest_tercile),
+    by = "stdid"
+  ) %>%
+  filter(ea_stud_group_criteria == 2, grade == 2) %>%
+  left_join(read_dta(here::here("data/fac_covariates.dta")), by = "facid")
+
+
+# fixing for course cleaning done by sk in sep 2021
+df <-
+  df %>% 
+  left_join(
+    read_dta(here::here("data/students_clean.dta")),
+    by = c("department_id", "course_name")
+  ) %>% 
+  mutate(
+    course_name = if_else(!is.na(course_clean_sk), course_clean_sk, course_name)
+  ) %>%
+  distinct(stdid, course_name, facid, .keep_all = T)
+
+
+# grade data after veda's work
+df_grades <-
+  read_dta(here::here("data/30jan2022/df_gradefac.dta")) %>% 
+  filter(facid != "") %>%
+  left_join(df_stu %>% select(stdid, department_id, reservation, math_lowest_tercile), by = "stdid") %>%
+  left_join(read_dta(here::here("data/controls.dta")), by = "stdid") %>%
+  left_join(read_dta(here::here("data/fac_covariates.dta")), by = "facid") %>% 
+  arrange(department_id, course_name, course_grade_clean) %>% 
+  group_by(department_id, course_name) %>% 
+  mutate(
+    course_rank = (scale(course_grade_clean) %>% pnorm() * 100) %>% as.vector
+  ) %>% 
+  ungroup() %>%
+  mutate(
+    father_college = if_else(father_ed_ind > 3 & !is.na(father_ed_ind), 1L, 0L),
+    father_college = if_else(is.na(father_ed_ind), NA_integer_, father_college),
+    mother_college = if_else(mother_ed_ind > 3 & !is.na(mother_ed_ind), 1L, 0L),
+    mother_college = if_else(is.na(mother_ed_ind), NA_integer_, mother_college),
+    ses = ses %>% as.integer(),
+    ses_lowest_tercile = if_else(ses == 1L, 1L, 0L),
+    rural = if_else(area == 1, 1L, 0L)
+  ) %>%
+  relocate(department_id, course_name, stdid, course_rank) %>% 
+  rename(reservation_stu = reservation, fac_active_teaching = fac_tpi_score3_z)
+
+# df_grades %>% drop_na() %>% glimpse()
+# df_grades %>% select(contains("college"))
+
+rm(df)
+
+df_mechanism <-
+  df_grades %>%
+  select(facid, reservation_fac, department_id, course_name, stdid) %>% 
+  left_join(
+    read_dta(here::here("data/fac_covars1.dta")), 
+    by = "facid"
+  ) %>% 
+  left_join(read_dta(here::here("data/fac_covars3.dta")), by = "facid") %>% 
+  left_join(read_dta(here::here("data/fac_covars2.dta")), by = "facid") %>% 
+  mutate_at(vars(starts_with("weekly")), ~ parse_number(.)) %>%
+  mutate(
+    total_time =
+      pmap_dbl(
+        select(., weekly_hours_teaching_related, weekly_hours_advising_students, weekly_hours_research, weekly_hours_part_time_job, weekly_hours_administrative),
+        ~ sum(c(...), na.rm = TRUE)
+      ),
+    fac_prop_research = (weekly_hours_research * 10) / total_time
+  )
+
+
+# facdata_all <- read_dta(here::here("data/endline_faculty_data_final.dta"))
+
+facdata_mentions <-
+  read_dta(here::here("data/all_appended.dta")) %>%
+  filter(tag > 1) %>%  # endline only
+  left_join(df_stu %>% select(stdid, department_id), by = "stdid") %>%  # get dep_id
+  select(facid, department_id) %>% 
+  count(facid, department_id) %>% 
+  arrange(facid, desc(n)) %>% 
+  distinct(facid, .keep_all = T) %>% 
+  select(-n) %>% 
+  left_join(read_dta(here::here("data/endline_faculty_data_final.dta")), by = "facid")
+```
+
+
+## Table 1: Faculty and Student Characteristics, Faculty Differences, and Balance Checks
+
+```{r, eval = F}
+df_grades %>%
+  distinct(facid, .keep_all = T) %>%  # consider unique student/faculty observations
+  summarise(
+    mean = round(mean(fac_degree_college_elite, na.rm = T), 2),
+    sd = round(sd(fac_degree_college_elite, na.rm = T), 2),
+  )
+
+df_grades %>%
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(fac_female ~ fac_active_teaching , data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid) %>%
+  knitreg(include.ci = F, digits = 3, stars = c(0.01, 0.05, 0.1))
+```
+
+
+
+```{=latex}
+\begin{table}[H]
+  \centering
+  \caption{}
+  \begin{tabular}{@{}lllllll@{}}
+    \toprule
+    \multicolumn{1}{c}{}  &  & \multicolumn{5}{c}{Panel A: Faculty}  \\ \cmidrule(l){3-7}
+                                      &           &               &             &           &                             &             \\
+    \textbf{Faculty characteristics}  & \textbf{} & \textbf{Mean} & \textbf{SD} & \textbf{} & \textbf{Active learning} & \textbf{SE} \\
+                                      &           &               &             &           &                             &             \\
+    Reservation status                &           & 0.40          & 0.49        &           & -0.016                      & 0.031       \\
+    Assistant Professor               &           & 0.72          & 0.45        &           & -0.000                      & 0.027       \\
+    Associate Professor               &           & 0.18          & 0.38        &           & -0.017                      & 0.020       \\
+    Professor                         &           & 0.08          & 0.27        &           &  0.026                      & 0.017       \\
+    Experience in years               &           & 9.96          & 6.51        &           &  0.629**                    & 0.319       \\
+    Highest degree is Masters         &           & 0.51          & 0.50        &           & -0.030                      & 0.034       \\
+    Highest degree is PhD             &           & 0.32          & 0.47        &           & -0.018                      & 0.023       \\
+    Highest degree is PhD in progress &           & 0.15          & 0.36        &           &  0.044                      & 0.028       \\
+    Degree college elite              &           & 0.32          & 0.47        &           & -0.002                      & 0.026       \\
+    Female                            &           & 0.33          & 0.47        &           & -0.092***                   & 0.031       \\
+                                      &           &               &             &           &                             &             \\ \cmidrule(l){3-7}
+    &  & \multicolumn{5}{c}{Panel B: Students} \\ \cmidrule(l){3-7}
+                                      &           &               &             &           &                             &             \\
+    \textbf{Student characteristics}  & \textbf{} & \textbf{Mean} & \textbf{SD} & \textbf{} & \textbf{Active learning} & \textbf{SE} \\
+                                      &           &               &             &           &                             &             \\
+    Female                            &           & 0.44          & 0.50        &           & -0.001                      & 0.003       \\
+    Age                               &           & 17.72         & 0.80        &           & 0.002                       & 0.006       \\
+    Reservation status                &           & 0.54          & 0.50        &           & -0.000                      & 0.004       \\
+    Father college                    &           & 0.50          & 0.50        &           & 0.002                       & 0.004       \\
+    Mother college                    &           & 0.35          & 0.48        &           & -0.000                      & 0.004       \\ \bottomrule
+  \end{tabular}
+\end{table}
+```
+
+
+\newpage
+
+## Regressions for Student Achievement by Active Learning in Classrooms
+
+### Table 2A: With student fixed effects
+
+```{r, results='asis'}
+lm1.2a <-
+  df_grades %>%
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching, data = ., fixed_effects = ~ stdid + fe_var, se_type = "stata", clusters = facid)
+
+lm1.2b <-
+  df_grades %>%
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ stdid + fe_var, se_type = "stata", clusters = facid)
+
+lm1.2c <-
+  df_grades %>%
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ stdid + fe_var, se_type = "stata", clusters = facid)
+
+lm1.2d <-
+  df_grades %>%
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ stdid + fe_var, se_type = "stata", clusters = facid)
+
+
+knitreg(list(lm1.2a, lm1.2b, lm1.2c, lm1.2d), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("I", "II", "III", "IV"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active learning", "Associate professor", "Professor", "Experience in years", "Highest degree is PhD", "Highest degree is PhD in progress", "Degree college elite", "Female"))
+```
+
+
+Notes:
+
+1. The dependent variable is the student course grade on a 0-100 scale, has mean 51.62 and standard deviation 28.02. Grades are provided at the course level and not at the faculty level.
+2. All models include department-course fixed effects and student fixed effects.
+3. Standard errors are clustered at the faculty level.
+
+\newpage
+
+### Table 2B: Without student fixed effects
+
+```{r, results='asis'}
+lm1.2a <-
+  df_grades %>%
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm1.2b <-
+  df_grades %>%
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm1.2c <-
+  df_grades %>%
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm1.2d <-
+  df_grades %>%
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+
+knitreg(list(lm1.2a, lm1.2b, lm1.2c, lm1.2d), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("I", "II", "III", "IV"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active learning", "Student: Female", "Student: Reservation", "Student: Rural", "Student: Low SES", "Associate professor", "Professor", "Experience in years", "Highest degree is PhD", "Highest degree is PhD in progress", "Degree college elite", "Female Faculty"))
+```
+
+
+Notes:
+
+1. The dependent variable is the student course grade on a 0-100 scale, has mean 51.62 and standard deviation 28.02. Grades are provided at the course level and not at the faculty level.
+2. All models include department-course fixed effects.
+3. Standard errors are clustered at the faculty level.
+
+\newpage
+
+## Heterogeneity
+
+### Table 3: By gender
+
+```{r, results='asis', eval=F}
+lm1a <-
+  df_grades %>%
+  filter(female == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + reservation_stu + rural + ses_lowest_tercile, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm1b <-
+  df_grades %>%
+  filter(female == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + reservation_stu + rural + ses_lowest_tercile, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2a <-
+  df_grades %>%
+  filter(female == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2b <-
+  df_grades %>%
+  filter(female == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3a <-
+  df_grades %>%
+  filter(female == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3b <-
+  df_grades %>%
+  filter(female == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4a <-
+  df_grades %>%
+  filter(female == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4b <-
+  df_grades %>%
+  filter(female == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+
+knitreg(list(lm1a, lm1b, lm2a, lm2b, lm3a, lm3b, lm4a, lm4b), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("Male", "Female", "Male", "Female", "Male", "Female", "Male", "Female"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active learning", "Student: Reservation", "Student: Rural", "Student: Low SES", "Associate professor", "Professor", "Experience in years", "Highest degree is PhD", "Highest degree is PhD in progress", "Degree college elite", "Female Faculty"))
+```
+
+
+```{=latex}
+\begin{table}[H]
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5}}
+\toprule
+ & \multicolumn{1}{c}{Male} & \multicolumn{1}{c}{Female} & \multicolumn{1}{c}{Male} & \multicolumn{1}{c}{Female} & \multicolumn{1}{c}{Male} & \multicolumn{1}{c}{Female} & \multicolumn{1}{c}{Male} & \multicolumn{1}{c}{Female} \\
+\midrule
+Active learning  & 0.15        & -0.75       & 0.12        & -0.77       & 0.10        & -0.73       & 0.26        & -0.63       \\
+                                  & (0.47)      & (0.54)      & (0.48)      & (0.61)      & (0.48)      & (0.57)      & (0.45)      & (0.56)      \\
+Student: Reservation              & -3.62^{***} & -6.41^{***} & -3.62^{***} & -6.44^{***} & -3.62^{***} & -6.44^{***} & -3.62^{***} & -6.45^{***} \\
+                                  & (0.66)      & (0.52)      & (0.66)      & (0.53)      & (0.66)      & (0.53)      & (0.66)      & (0.53)      \\
+Student: Rural                    & -3.19^{***} & -0.98^{**}  & -3.21^{***} & -1.01^{**}  & -3.21^{***} & -1.00^{**}  & -3.21^{***} & -1.00^{**}  \\
+                                  & (0.47)      & (0.47)      & (0.47)      & (0.47)      & (0.47)      & (0.47)      & (0.47)      & (0.47)      \\
+Student: Low SES               & -2.88^{***} & -4.08^{***} & -2.86^{***} & -4.05^{***} & -2.86^{***} & -4.06^{***} & -2.85^{***} & -4.07^{***} \\
+                                  & (0.54)      & (0.54)      & (0.54)      & (0.55)      & (0.54)      & (0.55)      & (0.54)      & (0.55)      \\
+Associate professor               &             &             & 1.29        & -0.18       & 1.32        & 1.44        & 1.45        & 1.43        \\
+                                  &             &             & (1.22)      & (1.23)      & (1.27)      & (1.24)      & (1.21)      & (1.24)      \\
+Professor                         &             &             & 7.01^{***}  & -2.18^{**}  & 7.19^{***}  & 0.69        & 7.10^{***}  & 0.84        \\
+                                  &             &             & (2.22)      & (1.09)      & (2.43)      & (1.66)      & (2.31)      & (1.64)      \\
+Experience in years               &             &             & -0.10       & 0.08        & -0.10       & 0.09        & -0.10       & 0.09        \\
+                                  &             &             & (0.08)      & (0.07)      & (0.08)      & (0.09)      & (0.08)      & (0.09)      \\
+Highest degree is PhD             &             &             &             &             & -0.48       & -3.73^{***} & -1.10       & -3.81^{***} \\
+                                  &             &             &             &             & (1.98)      & (1.33)      & (1.92)      & (1.32)      \\
+Highest degree is PhD in progress &             &             &             &             & 1.22        & -1.32       & 0.73        & -1.47       \\
+                                  &             &             &             &             & (1.95)      & (1.21)      & (1.82)      & (1.30)      \\
+Degree college elite              &             &             &             &             & 0.56        & 0.02        & 0.60        & -0.03       \\
+                                  &             &             &             &             & (1.10)      & (1.00)      & (1.08)      & (1.00)      \\
+Female Faculty                    &             &             &             &             &             &             & 2.11^{**}   & 0.65        \\
+                                  &             &             &             &             &             &             & (1.06)      & (0.84)      \\
+\midrule
+Num. obs.                         & 17516       & 16332       & 17493       & 16171       & 17492       & 16171       & 17492       & 16171       \\
+N Clusters                        & 439         & 428         & 437         & 425         & 436         & 425         & 436         & 425         \\
+\bottomrule
+\multicolumn{9}{l}{\scriptsize{$^{***}p<0.01$; $^{**}p<0.05$; $^{*}p<0.1$}}
+\end{tabular}}
+\caption{}
+\label{table:coefficients}
+\end{center}
+\end{table}
+```
+
+
+
+Notes:
+
+1. The dependent variable is the student course grade on a 0-100 scale, has mean 51.62 and standard deviation 28.02. Grades are provided at the course level and not at the faculty level.
+2. All models include department-course fixed effects.
+3. Standard errors are clustered at the faculty level.
+
+
+\newpage
+
+
+### Table 4: By baseline math achievement
+
+
+```{r, results='asis', eval=F}
+lm1a <-
+  df_grades %>%
+  filter(math_lowest_tercile == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm1b <-
+  df_grades %>%
+  filter(math_lowest_tercile == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2a <-
+  df_grades %>%
+  filter(math_lowest_tercile == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2b <-
+  df_grades %>%
+  filter(math_lowest_tercile == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3a <-
+  df_grades %>%
+  filter(math_lowest_tercile == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3b <-
+  df_grades %>%
+  filter(math_lowest_tercile == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4a <-
+  df_grades %>%
+  filter(math_lowest_tercile == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4b <-
+  df_grades %>%
+  filter(math_lowest_tercile == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+
+knitreg(list(lm1a, lm1b, lm2a, lm2b, lm3a, lm3b, lm4a, lm4b), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("High score", "Low score", "High score", "Low score", "High score", "Low score", "High score", "Low score"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active learning", "Student: Female", "Student: Reservation", "Student: Rural", "Student: Low SES", "Associate professor", "Professor", "Experience in years", "Highest degree is PhD", "Highest degree is PhD in progress", "Degree college elite", "Female Faculty"))
+```
+
+```{=latex}
+\begin{table}[H]
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l D{.}{.}{5.5} D{.}{.}{4.5} D{.}{.}{5.5} D{.}{.}{4.5} D{.}{.}{5.5} D{.}{.}{4.5} D{.}{.}{5.5} D{.}{.}{4.5}}
+\toprule
+ & \multicolumn{1}{c}{High score} & \multicolumn{1}{c}{Low score} & \multicolumn{1}{c}{High score} & \multicolumn{1}{c}{Low score} & \multicolumn{1}{c}{High score} & \multicolumn{1}{c}{Low score} & \multicolumn{1}{c}{High score} & \multicolumn{1}{c}{Low score} \\
+\midrule
+Active learning  & -0.63       & 0.59        & -0.54       & 0.42        & -0.75       & 0.32        & -0.55       & 0.55        \\
+                                  & (0.45)      & (0.74)      & (0.49)      & (0.77)      & (0.50)      & (0.78)      & (0.51)      & (0.75)      \\
+Student: Female                   & 12.47^{***} & 11.69^{***} & 12.51^{***} & 11.67^{***} & 12.54^{***} & 11.68^{***} & 12.54^{***} & 11.68^{***} \\
+                                  & (1.25)      & (1.13)      & (1.25)      & (1.13)      & (1.25)      & (1.13)      & (1.25)      & (1.13)      \\
+Student: Reservation              & -6.65^{***} & -1.95^{*}   & -6.60^{***} & -1.95^{*}   & -6.61^{***} & -1.95^{*}   & -6.61^{***} & -1.98^{*}   \\
+                                  & (0.62)      & (1.01)      & (0.62)      & (1.01)      & (0.62)      & (1.01)      & (0.62)      & (1.01)      \\
+Student: Rural                    & -0.52       & -2.62^{***} & -0.58       & -2.52^{***} & -0.56       & -2.52^{***} & -0.56       & -2.53^{***} \\
+                                  & (0.59)      & (0.97)      & (0.59)      & (0.97)      & (0.59)      & (0.97)      & (0.59)      & (0.97)      \\
+Student: Low SES               & -4.25^{***} & -3.62^{***} & -4.24^{***} & -3.61^{***} & -4.24^{***} & -3.61^{***} & -4.24^{***} & -3.61^{***} \\
+                                  & (0.68)      & (0.96)      & (0.68)      & (0.96)      & (0.68)      & (0.96)      & (0.68)      & (0.96)      \\
+Associate professor               &             &             & 1.60        & 1.07        & 3.39^{***}  & 2.27        & 3.40^{***}  & 2.26        \\
+                                  &             &             & (1.24)      & (1.71)      & (1.25)      & (1.97)      & (1.22)      & (1.98)      \\
+Professor                         &             &             & 2.72^{*}    & 0.79        & 6.10^{***}  & 3.45        & 6.35^{***}  & 3.70        \\
+                                  &             &             & (1.56)      & (2.55)      & (1.82)      & (3.02)      & (1.76)      & (2.95)      \\
+Experience in years               &             &             & -0.10       & 0.17        & -0.15^{**}  & 0.17        & -0.15^{**}  & 0.18        \\
+                                  &             &             & (0.07)      & (0.11)      & (0.07)      & (0.12)      & (0.07)      & (0.12)      \\
+Highest degree is PhD             &             &             &             &             & -3.39^{**}  & -4.02       & -3.61^{**}  & -4.54^{*}   \\
+                                  &             &             &             &             & (1.68)      & (2.66)      & (1.64)      & (2.61)      \\
+Highest degree is PhD in progress &             &             &             &             & 2.02        & -0.91       & 1.66        & -1.43       \\
+                                  &             &             &             &             & (1.31)      & (1.90)      & (1.32)      & (1.85)      \\
+Degree college elite              &             &             &             &             & -0.44       & 0.79        & -0.55       & 0.72        \\
+                                  &             &             &             &             & (1.19)      & (1.65)      & (1.17)      & (1.63)      \\
+Female Faculty                    &             &             &             &             &             &             & 1.76^{**}   & 2.13        \\
+                                  &             &             &             &             &             &             & (0.84)      & (1.34)      \\
+\midrule
+Num. obs.                         & 12167       & 5317        & 12086       & 5298        & 12086       & 5297        & 12086       & 5297        \\
+N Clusters                        & 463         & 395         & 460         & 392         & 460         & 391         & 460         & 391         \\
+\bottomrule
+\multicolumn{9}{l}{\scriptsize{$^{***}p<0.01$; $^{**}p<0.05$; $^{*}p<0.1$}}
+\end{tabular}}
+\caption{}
+\label{table:coefficients}
+\end{center}
+\end{table}
+```
+
+
+Notes:
+
+1. Low score refers to a student being in the bottom tercile of baseline math score. High score refers to a student being in the top and middle terciles of baseline math score.
+2. The dependent variable is the student course grade on a 0-100 scale, has mean 51.62 and standard deviation 28.02. Grades are provided at the course level and not at the faculty level.
+3. All models include department-course fixed effects.
+4. Standard errors are clustered at the faculty level.
+
+
+\newpage
+
+
+### Table 5: By socioeconomic status
+
+```{r, results='asis', eval=F}
+lm1a <-
+  df_grades %>%
+  filter(ses_lowest_tercile == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm1b <-
+  df_grades %>%
+  filter(ses_lowest_tercile == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2a <-
+  df_grades %>%
+  filter(ses_lowest_tercile == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2b <-
+  df_grades %>%
+  filter(ses_lowest_tercile == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3a <-
+  df_grades %>%
+  filter(ses_lowest_tercile == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3b <-
+  df_grades %>%
+  filter(ses_lowest_tercile == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4a <-
+  df_grades %>%
+  filter(ses_lowest_tercile == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4b <-
+  df_grades %>%
+  filter(ses_lowest_tercile == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + rural + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+
+knitreg(list(lm1a, lm1b, lm2a, lm2b, lm3a, lm3b, lm4a, lm4b), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("High SES", "Low SES", "High SES", "Low SES", "High SES", "Low SES", "High SES", "Low SES"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active learning", "Student: Female", "Student: Reservation", "Student: Rural", "Associate professor", "Professor", "Experience in years", "Highest degree is PhD", "Highest degree is PhD in progress", "Degree college elite", "Female Faculty"))
+```
+
+```{=latex}
+\begin{table}[H]
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5}}
+\toprule
+ & \multicolumn{1}{c}{High SES} & \multicolumn{1}{c}{Low SES} & \multicolumn{1}{c}{High SES} & \multicolumn{1}{c}{Low SES} & \multicolumn{1}{c}{High SES} & \multicolumn{1}{c}{Low SES} & \multicolumn{1}{c}{High SES} & \multicolumn{1}{c}{Low SES} \\
+\midrule
+Active learning  & -0.46       & 0.18        & -0.40       & 0.03        & -0.49       & -0.13       & -0.40       & 0.21        \\
+                                  & (0.41)      & (0.56)      & (0.45)      & (0.58)      & (0.45)      & (0.58)      & (0.43)      & (0.55)      \\
+Student: Female                   & 12.01^{***} & 12.04^{***} & 12.00^{***} & 12.07^{***} & 12.01^{***} & 12.07^{***} & 12.00^{***} & 12.06^{***} \\
+                                  & (0.77)      & (0.87)      & (0.77)      & (0.87)      & (0.77)      & (0.87)      & (0.77)      & (0.87)      \\
+Student: Reservation              & -5.11^{***} & -5.08^{***} & -5.11^{***} & -5.05^{***} & -5.11^{***} & -5.05^{***} & -5.11^{***} & -5.05^{***} \\
+                                  & (0.49)      & (0.69)      & (0.50)      & (0.69)      & (0.50)      & (0.69)      & (0.50)      & (0.69)      \\
+Student: Rural                    & -1.60^{***} & -1.77^{***} & -1.61^{***} & -1.79^{***} & -1.61^{***} & -1.78^{***} & -1.61^{***} & -1.78^{***} \\
+                                  & (0.46)      & (0.58)      & (0.46)      & (0.58)      & (0.46)      & (0.58)      & (0.46)      & (0.58)      \\
+Associate professor               &             &             & 0.85        & 0.20        & 2.05^{**}   & 1.23        & 2.03^{**}   & 1.46        \\
+                                  &             &             & (0.90)      & (1.38)      & (0.98)      & (1.56)      & (0.97)      & (1.50)      \\
+Professor                         &             &             & 0.93        & 1.92        & 3.36^{**}   & 3.85        & 3.48^{**}   & 4.25        \\
+                                  &             &             & (1.33)      & (2.18)      & (1.60)      & (3.06)      & (1.58)      & (2.82)      \\
+Experience in years               &             &             & -0.00       & 0.01        & 0.00        & -0.02       & 0.00        & -0.00       \\
+                                  &             &             & (0.06)      & (0.09)      & (0.07)      & (0.09)      & (0.07)      & (0.09)      \\
+Highest degree is PhD             &             &             &             &             & -3.83^{***} & -1.63       & -3.95^{***} & -2.27       \\
+                                  &             &             &             &             & (1.30)      & (2.12)      & (1.29)      & (2.01)      \\
+Highest degree is PhD in progress &             &             &             &             & -1.26       & 1.39        & -1.42       & 0.50        \\
+                                  &             &             &             &             & (1.07)      & (1.74)      & (1.10)      & (1.60)      \\
+Degree college elite              &             &             &             &             & 0.35        & -0.87       & 0.32        & -1.03       \\
+                                  &             &             &             &             & (0.81)      & (1.30)      & (0.81)      & (1.27)      \\
+Female Faculty                    &             &             &             &             &             &             & 0.79        & 2.95^{***}  \\
+                                  &             &             &             &             &             &             & (0.73)      & (1.11)      \\
+\midrule
+Num. obs.                         & 21932       & 11916       & 21801       & 11863       & 21800       & 11863       & 21800       & 11863       \\
+N Clusters                        & 482         & 451         & 479         & 448         & 478         & 448         & 478         & 448         \\
+\bottomrule
+\multicolumn{9}{l}{\scriptsize{$^{***}p<0.01$; $^{**}p<0.05$; $^{*}p<0.1$}}
+\end{tabular}}
+\caption{}
+\label{table:coefficients}
+\end{center}
+\end{table}
+```
+
+
+Notes:
+
+1. Low SES refers to a student being in the bottom tercile of the SES score taken from the first principal component of polychoric principal component analysis on equipment (e.g. TV, microwave, car, computer) present at a student's home. High score refers to a student being in the top and middle terciles of this SES score.
+2. The dependent variable is the student course grade on a 0-100 scale, has mean 51.62 and standard deviation 28.02. Grades are provided at the course level and not at the faculty level.
+3. All models include department-course fixed effects.
+4. Standard errors are clustered at the faculty level.
+
+
+\newpage
+
+### Table 6: By domicile
+
+```{r, results='asis', eval=F}
+lm1a <-
+  df_grades %>%
+  filter(rural == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + ses_lowest_tercile, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm1b <-
+  df_grades %>%
+  filter(rural == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + ses_lowest_tercile, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2a <-
+  df_grades %>%
+  filter(rural == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2b <-
+  df_grades %>%
+  filter(rural == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3a <-
+  df_grades %>%
+  filter(rural == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3b <-
+  df_grades %>%
+  filter(rural == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4a <-
+  df_grades %>%
+  filter(rural == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4b <-
+  df_grades %>%
+  filter(rural == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + reservation_stu + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+
+knitreg(list(lm1a, lm1b, lm2a, lm2b, lm3a, lm3b, lm4a, lm4b), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("Urban", "Rural", "Urban", "Rural", "Urban", "Rural", "Urban", "Rural"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active learning", "Student: Female", "Student: Reservation", "Student: Low SES", "Associate professor", "Professor", "Experience in years", "Highest degree is PhD", "Highest degree is PhD in progress", "Degree college elite", "Female Faculty"))
+```
+
+```{=latex}
+\begin{table}[H]
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5}}
+\toprule
+ & \multicolumn{1}{c}{Urban} & \multicolumn{1}{c}{Rural} & \multicolumn{1}{c}{Urban} & \multicolumn{1}{c}{Rural} & \multicolumn{1}{c}{Urban} & \multicolumn{1}{c}{Rural} & \multicolumn{1}{c}{Urban} & \multicolumn{1}{c}{Rural} \\
+\midrule
+Active learning  & 0.27        & -0.82       & 0.23        & -0.78       & 0.13        & -0.88       & 0.19        & -0.56       \\
+                                  & (0.37)      & (0.55)      & (0.39)      & (0.61)      & (0.41)      & (0.59)      & (0.40)      & (0.54)      \\
+Student: Female                   & 11.14^{***} & 13.93^{***} & 11.13^{***} & 13.95^{***} & 11.14^{***} & 13.96^{***} & 11.14^{***} & 13.96^{***} \\
+                                  & (0.70)      & (0.93)      & (0.70)      & (0.93)      & (0.70)      & (0.93)      & (0.70)      & (0.93)      \\
+Student: Reservation              & -5.04^{***} & -4.90^{***} & -5.05^{***} & -4.86^{***} & -5.04^{***} & -4.87^{***} & -5.05^{***} & -4.88^{***} \\
+                                  & (0.52)      & (0.65)      & (0.52)      & (0.65)      & (0.52)      & (0.65)      & (0.52)      & (0.65)      \\
+Student: Low SES                  & -3.26^{***} & -3.70^{***} & -3.25^{***} & -3.69^{***} & -3.25^{***} & -3.69^{***} & -3.25^{***} & -3.69^{***} \\
+                                  & (0.56)      & (0.56)      & (0.56)      & (0.56)      & (0.56)      & (0.56)      & (0.56)      & (0.56)      \\
+Associate professor               &             &             & -1.16       & 2.10        & -0.12       & 3.26^{**}   & -0.12       & 3.32^{**}   \\
+                                  &             &             & (0.95)      & (1.31)      & (1.06)      & (1.37)      & (1.04)      & (1.34)      \\
+Professor                         &             &             & 0.59        & 1.97        & 2.68        & 4.48^{**}   & 2.75        & 4.93^{**}   \\
+                                  &             &             & (1.40)      & (1.58)      & (1.81)      & (2.18)      & (1.79)      & (2.03)      \\
+Experience in years               &             &             & 0.06        & -0.06       & 0.05        & -0.07       & 0.05        & -0.06       \\
+                                  &             &             & (0.06)      & (0.08)      & (0.06)      & (0.09)      & (0.06)      & (0.09)      \\
+Highest degree is PhD             &             &             &             &             & -2.98^{**}  & -3.10^{*}   & -3.09^{**}  & -3.55^{**}  \\
+                                  &             &             &             &             & (1.36)      & (1.70)      & (1.37)      & (1.58)      \\
+Highest degree is PhD in progress &             &             &             &             & -0.02       & -0.29       & -0.17       & -0.87       \\
+                                  &             &             &             &             & (1.03)      & (1.48)      & (1.03)      & (1.42)      \\
+Degree college elite              &             &             &             &             & 0.22        & 0.14        & 0.20        & -0.03       \\
+                                  &             &             &             &             & (0.82)      & (1.07)      & (0.82)      & (1.06)      \\
+Female Faculty                    &             &             &             &             &             &             & 0.64        & 2.57^{***}  \\
+                                  &             &             &             &             &             &             & (0.80)      & (0.92)      \\
+\midrule
+Num. obs.                         & 18232       & 15616       & 18146       & 15518       & 18145       & 15518       & 18145       & 15518       \\
+N Clusters                        & 471         & 461         & 468         & 458         & 467         & 458         & 467         & 458         \\
+\bottomrule
+\multicolumn{9}{l}{\scriptsize{$^{***}p<0.01$; $^{**}p<0.05$; $^{*}p<0.1$}}
+\end{tabular}}
+\caption{}
+\label{table:coefficients}
+\end{center}
+\end{table}
+```
+
+
+Notes:
+
+1. The dependent variable is the student course grade on a 0-100 scale, has mean 51.62 and standard deviation 28.02. Grades are provided at the course level and not at the faculty level.
+2. All models include department-course fixed effects.
+3. Standard errors are clustered at the faculty level.
+
+\newpage
+
+### Table 7: By reservation status
+
+```{r, results='asis', eval=F}
+lm1a <-
+  df_grades %>%
+  filter(reservation_stu == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + rural + ses_lowest_tercile, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm1b <-
+  df_grades %>%
+  filter(reservation_stu == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + rural + ses_lowest_tercile, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2a <-
+  df_grades %>%
+  filter(reservation_stu == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm2b <-
+  df_grades %>%
+  filter(reservation_stu == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3a <-
+  df_grades %>%
+  filter(reservation_stu == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm3b <-
+  df_grades %>%
+  filter(reservation_stu == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4a <-
+  df_grades %>%
+  filter(reservation_stu == 0) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+lm4b <-
+  df_grades %>%
+  filter(reservation_stu == 1) %>% 
+  mutate(fe_var = str_c(department_id, course_name, sep = "_")) %>%
+  lm_robust(course_rank ~ fac_active_teaching + female + rural + ses_lowest_tercile + fac_associate_professor + fac_professor + fac_yearsinhighed + fac_highest_degree_phd + fac_highest_degree_phd_in_prog + fac_degree_college_elite + fac_female, data = ., fixed_effects = ~ fe_var, se_type = "stata", clusters = facid)
+
+
+texreg(list(lm1a, lm1b, lm2a, lm2b, lm3a, lm3b, lm4a, lm4b), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("Non-res", "Res", "Non-res", "Res", "Non-res", "Res", "Non-res", "Res"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active learning", "Student: Female", "Student: Reservation", "Student: Low SES", "Associate professor", "Professor", "Experience in years", "Highest degree is PhD", "Highest degree is PhD in progress", "Degree college elite", "Female Faculty"))
+```
+
+```{=latex}
+\begin{table}[H]
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5} D{.}{.}{5.5}}
+\toprule
+ & \multicolumn{1}{c}{Non-res} & \multicolumn{1}{c}{Res} & \multicolumn{1}{c}{Non-res} & \multicolumn{1}{c}{Res} & \multicolumn{1}{c}{Non-res} & \multicolumn{1}{c}{Res} & \multicolumn{1}{c}{Non-res} & \multicolumn{1}{c}{Res} \\
+\midrule
+Active learning                   & 0.31        & -0.82^{*}   & 0.28        & -0.82^{*}   & 0.11        & -0.84^{*}   & 0.36        & -0.72       \\
+                                  & (0.46)      & (0.44)      & (0.49)      & (0.48)      & (0.49)      & (0.48)      & (0.46)      & (0.46)      \\
+Student: Female                   & 12.71^{***} & 11.88^{***} & 12.73^{***} & 11.86^{***} & 12.74^{***} & 11.88^{***} & 12.74^{***} & 11.87^{***} \\
+                                  & (1.05)      & (0.67)      & (1.05)      & (0.67)      & (1.06)      & (0.67)      & (1.06)      & (0.67)      \\
+Student: Reservation              & -1.96^{***} & -1.50^{***} & -1.99^{***} & -1.50^{***} & -1.98^{***} & -1.50^{***} & -1.99^{***} & -1.50^{***} \\
+                                  & (0.51)      & (0.49)      & (0.51)      & (0.50)      & (0.51)      & (0.50)      & (0.51)      & (0.50)      \\
+Student: Low SES                  & -2.32^{***} & -4.17^{***} & -2.32^{***} & -4.13^{***} & -2.31^{***} & -4.14^{***} & -2.32^{***} & -4.13^{***} \\
+                                  & (0.56)      & (0.51)      & (0.56)      & (0.52)      & (0.56)      & (0.52)      & (0.56)      & (0.52)      \\
+Associate professor               &             &             & 0.83        & 0.02        & 1.96^{*}    & 1.09        & 1.96^{*}    & 1.13        \\
+                                  &             &             & (1.00)      & (1.11)      & (1.16)      & (1.23)      & (1.13)      & (1.21)      \\
+Professor                         &             &             & -0.17       & 2.34        & 2.11        & 4.75^{**}   & 2.37        & 4.93^{**}   \\
+                                  &             &             & (1.47)      & (1.69)      & (1.93)      & (2.27)      & (1.84)      & (2.21)      \\
+Experience in years               &             &             & 0.08        & -0.07       & 0.07        & -0.07       & 0.08        & -0.07       \\
+                                  &             &             & (0.06)      & (0.07)      & (0.07)      & (0.08)      & (0.07)      & (0.08)      \\
+Highest degree is PhD             &             &             &             &             & -2.92^{**}  & -3.44^{**}  & -3.29^{**}  & -3.61^{**}  \\
+                                  &             &             &             &             & (1.47)      & (1.68)      & (1.43)      & (1.64)      \\
+Highest degree is PhD in progress &             &             &             &             & 0.06        & -0.74       & -0.38       & -1.04       \\
+                                  &             &             &             &             & (1.17)      & (1.26)      & (1.13)      & (1.24)      \\
+Degree college elite              &             &             &             &             & 0.27        & 0.18        & 0.18        & 0.12        \\
+                                  &             &             &             &             & (0.92)      & (0.97)      & (0.92)      & (0.95)      \\
+Female Faculty                    &             &             &             &             &             &             & 1.85^{**}   & 1.35^{*}    \\
+                                  &             &             &             &             &             &             & (0.86)      & (0.81)      \\
+\midrule
+Num. obs.                         & 16323       & 17525       & 16242       & 17422       & 16242       & 17421       & 16242       & 17421       \\
+N Clusters                        & 468         & 471         & 465         & 468         & 465         & 467         & 465         & 467         \\
+\bottomrule
+\multicolumn{9}{l}{\scriptsize{$^{***}p<0.01$; $^{**}p<0.05$; $^{*}p<0.1$}}
+\end{tabular}}
+\caption{}
+\label{table:coefficients}
+\end{center}
+\end{table}
+```
+
+
+Notes:
+
+1. Students belonging to the 'General' category are considered as non-reservation students, all others (SC/ST/OBC/Other categories) are considered as reservation students.
+2. The dependent variable is the student course grade on a 0-100 scale, has mean 51.62 and standard deviation 28.02. Grades are provided at the course level and not at the faculty level.
+3. All models include department-course fixed effects.
+4. Standard errors are clustered at the faculty level.
+
+
+
+\newpage
+
+
+## Table 8: Comparing Analysis Sample with the Representative National Sample for India
+
+
+```{r, eval=F}
+# faculty
+facdata_mentions %>% 
+  select(department_id, fac_reservation, fac_assistant_professor, fac_associate_professor, fac_professor, fac_yearsinhighed, fac_highest_degree_masters, fac_highest_degree_phd, fac_highest_degree_phd_in_prog, fac_degree_college_elite, fac_female) %>% 
+  bind_rows(
+    df_grades %>% filter(elite == 0) %>% distinct(facid, .keep_all = T) %>% select(department_id, fac_reservation, fac_assistant_professor, fac_associate_professor, fac_professor, fac_yearsinhighed, fac_highest_degree_masters, fac_highest_degree_phd, fac_highest_degree_phd_in_prog, fac_degree_college_elite, fac_female), .id = "analysis_sample"
+  ) %>% 
+  mutate(
+    analysis_sample = as.integer(analysis_sample) - 1L,
+  ) %>%
+  left_join(read_csv("/Users/saurabh/Everything/GitHub/teacher-like-me/data/depweights.csv"), by = "department_id") %>%
+  group_by(analysis_sample) %>%
+  # summarize_at(vars(starts_with("fac_")), ~ round(weighted.mean(., w = sw_f, na.rm = T), 2)) %>%
+  summarize_at(vars(starts_with("fac_")), ~ round(sqrt(wtd.var(., sw_f)), 2)) %>%
+  pivot_longer(cols = -analysis_sample) %>%
+  pivot_wider(names_from = analysis_sample, values_from = value) %>% 
+  select(name, `1`, `0`)
+
+# students
+df_stu %>% 
+  select(stdid, department_id, reservation) %>% 
+  left_join(read_dta(here::here("data/controls.dta")), by = "stdid") %>% 
+  mutate(
+    father_college = if_else(father_ed_ind > 3 & !is.na(father_ed_ind), 1L, 0L),
+    father_college = if_else(is.na(father_ed_ind), NA_integer_, father_college),
+  ) %>%
+  select(reservation, female, age, father_college, department_id) %>% 
+  bind_rows(
+    df_grades %>% distinct(stdid, .keep_all = T) %>% select(reservation = reservation_stu, female, age, father_college, department_id), .id = "analysis_sample"
+  ) %>%
+  left_join(read_csv("/Users/saurabh/Everything/GitHub/teacher-like-me/data/depweights.csv"), by = "department_id") %>%
+  mutate(
+    analysis_sample = as.integer(analysis_sample) - 1L,
+    female = female %>% as.integer()
+  ) %>%
+  group_by(analysis_sample) %>%
+  # summarize_at(vars(reservation, female, age, father_college), ~ round(weighted.mean(., w = sw_f, na.rm = T), 2)) %>%
+  summarize_at(vars(reservation, female, age, father_college), ~ round(sqrt(wtd.var(., sw_f)), 2)) %>%
+  pivot_longer(cols = -analysis_sample) %>%
+  pivot_wider(names_from = analysis_sample, values_from = value) %>%
+  select(name, `1`, `0`)
+```
+
+
+```{=latex}
+\begin{table}[H]
+\centering
+\caption{}
+\label{tab:sample-stats}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Attribute                         & Analysis Sample & Full Sample  \\ \midrule
+                                  & \multicolumn{2}{c}{Faculty}    \\ \cmidrule(l){2-3} 
+Reservation status                & 0.41 (0.49)     & 0.50 (0.50)  \\
+Assistant professor               & 0.72 (0.45)     & 0.77 (0.42)  \\
+Associate professor               & 0.17 (0.38)     & 0.13 (0.34)  \\
+Professor                         & 0.07 (0.26)     & 0.06 (0.23)  \\
+Experience in years               & 9.61 (6.23)     & 9.49 (6.86)  \\
+Highest degree is Masters         & 0.59 (0.49)     & 0.61 (0.49)  \\
+Highest degree is PhD in progress & 0.15 (0.35)     & 0.19 (0.39)  \\
+Highest degree is PhD             & 0.24 (0.43)     & 0.17 (0.38)  \\
+Degree from elite college         & 0.27 (0.44)     & 0.25 (0.43)  \\
+Female                            & 0.35 (0.48)     & 0.42 (0.49)  \\
+                                  &                 &              \\ \cmidrule(l){2-3}
+                                  & \multicolumn{2}{c}{Students}   \\ \cmidrule(l){2-3} 
+Reservation status                & 0.54 (0.50)     & 0.56 (0.50)  \\
+Female                            & 0.39 (0.49)     & 0.41 (0.49)  \\
+Age                               & 17.78 (0.84)    & 18.95 (1.49) \\
+Father attended college           & 0.49 (0.50)     & 0.48 (0.50)  \\ \midrule
+Number of students                & 2268            & 20239        \\
+Number of faculty                 & 501             & 2710         \\
+Number of colleges                & 12              & 50           \\
+Number of departments             & 20              & 100          \\ \bottomrule
+\end{tabular}
+\end{table}
+```
+
+
+Notes:
+
+1. Means reported with standard deviations in parentheses.
+2. All statistics calculated using department-level sampling weights defined across the full national sample of surveyed colleges.
+
+
+\newpage
+
+# Cross country
+
+```{r}
+# load cross country data
+
+df_stu_cc <-
+  haven::read_dta("/Users/saurabh/Everything/Supertest/Data/All/16. latest data for prashant (includng cr-flex scores)/1. student_baseline_endline_merged_data_11.7.2019.dta") %>% 
+  filter(univtype == 1 | is.na(univtype), grade == 2) %>% 
+  select(stdid, e_mathstudy_1:e_mathstudy_11, e_physicsstudy_1:e_physicsstudy_11) %>%
+  mutate_at(vars(e_mathstudy_1:e_mathstudy_11, e_physicsstudy_1:e_physicsstudy_11), ~ as.integer(.)) %>%
+  mutate_at(vars(e_mathstudy_6:e_mathstudy_11, e_physicsstudy_6:e_physicsstudy_11), ~ dplyr::recode(., `1` = 5L, `2` = 4L, `4` = 2L, `5` = 1L))
+
+
+# physics active scores
+
+df_fac <- df_stu_cc %>% select(stdid, contains("physics")) %>% drop_na()
+fit_b <- fa(df_fac %>% select(-stdid), nfactors = 1, scores = "regression")
+fit_b_scores <- factor.scores(df_fac %>% select(-stdid), fit_b)
+
+
+df_phys <-
+  df_fac %>% 
+  bind_cols(fit_b_scores$scores) %>%
+  transmute(stdid, active_phys = MR1)
+
+
+# math active scores
+
+df_fac <- df_stu_cc %>% select(stdid, contains("math")) %>% drop_na()
+fit_b <- fa(df_fac %>% select(-stdid), nfactors = 1, scores = "regression")
+fit_b_scores <- factor.scores(df_fac %>% select(-stdid), fit_b)
+
+df_math <-
+  df_fac %>% 
+  bind_cols(fit_b_scores$scores) %>%
+  transmute(stdid, active_math = MR1)
+```
+
+```{r}
+# creating df for cross-country regressions
+df_stu_cc <-
+  haven::read_dta("/Users/saurabh/Everything/Supertest/Data/All/16. latest data for prashant (includng cr-flex scores)/1. student_baseline_endline_merged_data_11.7.2019.dta") %>% 
+  filter(univtype == 1 | is.na(univtype), grade == 2)
+
+df_areg <-
+  bind_rows(
+  "math" = df_stu_cc %>%
+    left_join(df_math, by = "stdid") %>%
+    select(stdid, country, department_id, g1_score = scaled_math_irt_ability_g1, g3_score = scaled_math_irt_ability_g3, active_score = active_math),
+  "physics" = df_stu_cc %>% 
+    left_join(df_phys, by = "stdid") %>%
+    select(stdid, country, department_id, g1_score = scaled_physics_irt_ability_g1, g3_score = scaled_physics_irt_ability_g3, active_score = active_phys),
+  .id = "subject"
+) %>% 
+  arrange(stdid, subject) %>% 
+  drop_na(g3_score, g1_score, active_score)
+```
+
+
+```{r}
+## Creating controls for areg now ##
+
+# China controls
+df_fac <-
+  df_stu_cc %>%
+  filter(country == "China") %>% 
+  select(stdid, gender, b_math_g1_score, contains(c("b_ses_", "b_cr_ses"))) %>%
+  mutate_at(vars(contains("_ses_")), ~ as.integer(.)) %>% 
+  mutate_at(vars(contains("_ses_")), ~ dplyr::recode(., `2` = 0L)) %>% 
+  drop_na(contains("_ses_"))
+
+fit_b <- fa(df_fac %>% select(-c(stdid, gender, b_math_g1_score)), nfactors = 1, scores = "regression")
+fit_b_scores <- factor.scores(df_fac %>% select(-c(stdid, gender, b_math_g1_score)), fit_b)
+
+df_china_controls <-
+  df_fac %>% 
+  bind_cols(fit_b_scores$scores) %>%
+  transmute(
+    stdid,
+    female = as.integer(gender) - 1L,
+    ses_raw = MR1,
+    ses = ntile(ses_raw, 3),
+    ses_lowest_tercile = if_else(ses == 1L, 1L, 0L),
+    math_tercile = ntile(b_math_g1_score, 3),
+    math_lowest_tercile = if_else(math_tercile == 1, 1L, 0L),
+  ) %>% 
+  select(stdid, female, math_lowest_tercile, ses_lowest_tercile)
+
+
+# Russia controls
+df_fac <-
+  df_stu_cc %>%
+  filter(country == "Russia") %>% 
+  select(stdid, gender, b_math_g1_score, contains(c("b_ses_", "b_cr_ses"))) %>%
+  mutate_at(vars(contains("_ses_")), ~ as.integer(.)) %>% 
+  mutate_at(vars(contains("_ses_")), ~ dplyr::recode(., `2` = 0L)) %>% 
+  drop_na(contains("_ses_"))
+
+fit_b <- fa(df_fac %>% select(-c(stdid, gender, b_math_g1_score)), nfactors = 1, scores = "regression")
+fit_b_scores <- factor.scores(df_fac %>% select(-c(stdid, gender, b_math_g1_score)), fit_b)
+
+df_russia_controls <-
+  df_fac %>% 
+  bind_cols(fit_b_scores$scores) %>%
+  transmute(
+    stdid,
+    female = as.integer(gender) - 1L,
+    ses_raw = MR1,
+    ses = ntile(ses_raw, 3),
+    ses_lowest_tercile = if_else(ses == 1L, 1L, 0L),
+    math_tercile = ntile(b_math_g1_score, 3),
+    math_lowest_tercile = if_else(math_tercile == 1, 1L, 0L),
+  ) %>% 
+  select(stdid, female, math_lowest_tercile, ses_lowest_tercile)
+
+# India controls
+df_india_controls <-
+  df_stu %>% 
+  select(stdid, math_lowest_tercile) %>% 
+  left_join(read_dta(here::here("data/controls.dta")) %>% select(stdid, ses, female), by = "stdid") %>% 
+  mutate_at(vars(ses, female), ~ as.integer(.)) %>% 
+  mutate(ses_lowest_tercile = if_else(ses == 1L, 1L, 0L)) %>% 
+  select(-ses)
+
+df_controls <- bind_rows(df_china_controls, df_russia_controls, df_india_controls)
+
+df_areg <- df_areg %>% left_join(df_controls, by = "stdid")
+```
+
+
+
+## Table 9: Main treatment effects
+
+```{r, results='asis'}
+lm1 <-
+  df_areg %>% 
+  filter(country == "India") %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm2 <-
+  df_areg %>% 
+  filter(country == "China") %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm3 <-
+  df_areg %>% 
+  filter(country == "Russia") %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+knitreg(list(lm1, lm2, lm3), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("India", "China", "Russia"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active Learning", "Baseline score"))
+```
+
+Notes:
+
+1. All models include cross-subject (math and physics) student fixed effects.
+2. Baseline score refers to baseline achievement in math and physics tests administered to students.
+3. Standard errors are clustered at the department level.
+
+\newpage
+
+## Heterogeneity
+
+### Table 10: By gender
+
+```{r, results='asis'}
+lm1a <-
+  df_areg %>% 
+  filter(country == "India", female == 1) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm1b <-
+  df_areg %>% 
+  filter(country == "India", female == 0) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm2a <-
+  df_areg %>% 
+  filter(country == "China", female == 1) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm2b <-
+  df_areg %>% 
+  filter(country == "China", female == 0) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm3a <-
+  df_areg %>% 
+  filter(country == "Russia", female == 1) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm3b <-
+  df_areg %>% 
+  filter(country == "Russia", female == 0) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+knitreg(list(lm1a, lm1b, lm2a, lm2b, lm3a, lm3b), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("India Female", "India Male", "China Female", "China Male", "Russia Female", "Russia Male"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active Learning", "Baseline score"))
+```
+
+Notes:
+
+1. All models include cross-subject (math and physics) student fixed effects.
+2. Baseline score refers to baseline achievement in math and physics tests administered to students.
+3. Standard errors are clustered at the department level.
+
+\newpage
+
+### Table 11: By baseline math achievement
+
+```{r, results='asis', eval=F}
+lm1a <-
+  df_areg %>% 
+  filter(country == "India", math_lowest_tercile == 0) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm1b <-
+  df_areg %>% 
+  filter(country == "India", math_lowest_tercile == 1) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm2a <-
+  df_areg %>% 
+  filter(country == "China", math_lowest_tercile == 0) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm2b <-
+  df_areg %>% 
+  filter(country == "China", math_lowest_tercile == 1) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm3a <-
+  df_areg %>% 
+  filter(country == "Russia", math_lowest_tercile == 0) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm3b <-
+  df_areg %>% 
+  filter(country == "Russia", math_lowest_tercile == 1) %>%
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+texreg(list(lm1a, lm1b, lm2a, lm2b, lm3a, lm3b), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("India High Score", "India Low Score", "China High Score", "China Low Score", "Russia High Score", "Russia Low Score"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active Learning", "Baseline score"))
+```
+
+```{=latex}
+\begin{table}[H]
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l D{.}{.}{4.4} D{.}{.}{4.3} D{.}{.}{4.5} D{.}{.}{4.3} D{.}{.}{3.3} D{.}{.}{3.3}}
+\toprule
+ & \multicolumn{1}{c}{India High Score} & \multicolumn{1}{c}{India Low Score} & \multicolumn{1}{c}{China High Score} & \multicolumn{1}{c}{China Low Score} & \multicolumn{1}{c}{Russia High Score} & \multicolumn{1}{c}{Russia Low Score} \\
+\midrule
+Active Learning & 0.01      & 0.04   & 0.00       & 0.02   & -0.00    & -0.00  \\
+                & (0.02)    & (0.03) & (0.04)     & (0.05) & (0.06)   & (0.07) \\
+Baseline score  & 0.15^{**} & -0.06  & 0.21^{***} & 0.06   & 0.18^{*} & 0.10   \\
+                & (0.06)    & (0.04) & (0.04)     & (0.06) & (0.10)   & (0.11) \\
+\midrule
+Num. obs.       & 5023      & 2390   & 2526       & 1197   & 872      & 456    \\
+N Clusters      & 97        & 96     & 105        & 97     & 129      & 101    \\
+\bottomrule
+\multicolumn{7}{l}{\scriptsize{$^{***}p<0.01$; $^{**}p<0.05$; $^{*}p<0.1$}}
+\end{tabular}}
+\caption{}
+\label{table:coefficients}
+\end{center}
+\end{table}
+```
+
+
+Notes:
+
+1. All models include cross-subject (math and physics) student fixed effects.
+2. Baseline score refers to baseline achievement in math and physics tests administered to students.
+3. Standard errors are clustered at the department level.
+
+\newpage
+
+### Table 12: By socioeconomic status
+
+```{r, results='asis', eval=F}
+lm1a <-
+  df_areg %>% 
+  filter(country == "India", ses_lowest_tercile == 0) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm1b <-
+  df_areg %>% 
+  filter(country == "India", ses_lowest_tercile == 1) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm2a <-
+  df_areg %>% 
+  filter(country == "China", ses_lowest_tercile == 0) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm2b <-
+  df_areg %>% 
+  filter(country == "China", ses_lowest_tercile == 1) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm3a <-
+  df_areg %>% 
+  filter(country == "Russia", ses_lowest_tercile == 0) %>% 
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+lm3b <-
+  df_areg %>% 
+  filter(country == "Russia", ses_lowest_tercile == 1) %>%
+  lm_robust(g3_score ~ active_score + g1_score, fixed_effects = ~ stdid, data = ., clusters = department_id, se_type = "stata")
+
+texreg(list(lm1a, lm1b, lm2a, lm2b, lm3a, lm3b), custom.note = "%stars", stars = c(0.01, 0.05, 0.1), include.ci = FALSE, custom.model.names = c("India High SES", "India Low SES", "China High SES", "China Low SES", "Russia High SES", "Russia Low SES"), dcolumn = TRUE, booktabs = TRUE, float.pos = "H", caption = "", digits = 2, include.rsquared = F, include.adjrs = F, include.rmse = F, custom.coef.names = c("Active Learning", "Baseline score"))
+```
+
+
+```{=latex}
+\begin{table}[H]
+\begin{center}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l D{.}{.}{4.3} D{.}{.}{4.4} D{.}{.}{4.5} D{.}{.}{4.5} D{.}{.}{3.3} D{.}{.}{3.3}}
+\toprule
+ & \multicolumn{1}{c}{India High SES} & \multicolumn{1}{c}{India Low SES} & \multicolumn{1}{c}{China High SES} & \multicolumn{1}{c}{China Low SES} & \multicolumn{1}{c}{Russia High SES} & \multicolumn{1}{c}{Russia Low SES} \\
+\midrule
+Active Learning & 0.02   & 0.01      & 0.02       & -0.02      & -0.02  & 0.04   \\
+                & (0.02) & (0.03)    & (0.03)     & (0.07)     & (0.06) & (0.09) \\
+Baseline score  & 0.03   & 0.11^{**} & 0.19^{***} & 0.17^{***} & 0.12   & 0.19   \\
+                & (0.04) & (0.04)    & (0.04)     & (0.05)     & (0.08) & (0.20) \\
+\midrule
+Num. obs.       & 5010   & 2313      & 2504       & 1219       & 921    & 409    \\
+N Clusters      & 97     & 97        & 106        & 101        & 131    & 111    \\
+\bottomrule
+\multicolumn{7}{l}{\scriptsize{$^{***}p<0.01$; $^{**}p<0.05$; $^{*}p<0.1$}}
+\end{tabular}}
+\caption{}
+\label{table:coefficients}
+\end{center}
+\end{table}
+```
+
+
+Notes:
+
+1. All models include cross-subject (math and physics) student fixed effects.
+2. Baseline score refers to baseline achievement in math and physics tests administered to students.
+3. Standard errors are clustered at the department level.
